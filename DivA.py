@@ -2,7 +2,9 @@
 
 ##Import libraries
 from modules import *
-
+import multiprocessing as mp 
+from multiprocessing import Process, Manager
+import json
 ####################
 ###Get the options
 
@@ -19,6 +21,7 @@ parser.add_argument("-d", type=int, default=2, help='The number of standard devi
 parser.add_argument("-zd", type=int, default=2, help='The number of standard deviations from the mean of the Zbeta parameter to use as threshold [default 2]')
 parser.add_argument("-o", default="out", help='Output basename prefix [default "out"]')
 parser.add_argument("-m", default="blosum62.txt", help='The amino acid distance matrix [default "blosum62.txt"]')
+parser.add_argument("-c", "--cpu",type=int, default=1, help="number of threads available to run DivA")
 
 args = parser.parse_args()
 
@@ -51,36 +54,40 @@ for element in aminoacids:
 	aaFreqsDict[element]=[] 
 
 windowsMaster={}
-wrongMaster={} #This is going to be the windows from {windows} that have 1 in the [classification][i]
+wrongMaster={}
+
+ #This is going to be the windows from {windows} that have 1 in the [classification][i]
 #################################################### Main body
 
 ########## Get and trim the windows and associated parameters values
 
-for filename in alnNames:
+def run_DivA(filename, windowsMaster, wrongMaster,  matrixAA):
 	windows= {} #I had to make a dictionary with all the output with the values to then calculate the thresholds. It's: windows[name]=[ [filename], [start],[end],[P],[Z],[D],[Z62],[classificacion] ]
 	filename=filename.rstrip()
 	print("I'm in %s"%(filename))   
 	align = AlignIO.read(filename, "fasta")
-        j=0
-        while j<len(align[1].seq)-window:
-                windowAlign=align[:, j:j+window]
-                scoresProb=getAveProbPerWindowPerSeq(windowAlign,maxGapContent,aaFreqsDict)
-                scoresMatrixPerCol=getColumnDistScoreToClosest(windowAlign, matrixAA)
-                #here is where it goes species per species testing the window values        
-                for record in align: 
-                        name=record.id
-                        P=scoresProb[name][0]
+	j=0
+	while j<len(align[1].seq)-window:
+		windowAlign=align[:, j:j+window]
+		scoresProb=getAveProbPerWindowPerSeq(windowAlign,maxGapContent,aaFreqsDict)
+		scoresMatrixPerCol=getColumnDistScoreToClosest(windowAlign, matrixAA)
+		#here is where it goes species per species testing the window values        
+		for record in align: 
+			name=record.id
+			P=scoresProb[name][0]
 			if P!="NA" and float(P)<0.7: #Now I don't want the windows that would result in NAs which are given if P==NA or float(P)>0.7 (too conserved)
 				start=j+1
 				end=j+window
-                                firstAA,lastAA=getFirstLastAA(windowAlign,aaFreqsDict,name)
+				firstAA,lastAA=getFirstLastAA(windowAlign,aaFreqsDict,name)
 				if ( (lastAA!="NA" and lastAA>0.9) or (firstAA!="NA" and firstAA>0.9) ): #Check if I need to trim and recalculate
-	                                windowAlign, start, end= trimWindowEdges(windowAlign, align, aaFreqsDict,name, start, end, firstAA,lastAA ) #I turned this part into this function
-	                                scoresProb=getAveProbPerWindowPerSeq(windowAlign, maxGapContent,aaFreqsDict)
-        	                        scoresMatrixPerCol=getColumnDistScoreToClosest(windowAlign, matrixAA)
+					windowAlign, start, end= trimWindowEdges(windowAlign, align, aaFreqsDict,name, start, end, firstAA,lastAA ) #I turned this part into this function
+					scoresProb=getAveProbPerWindowPerSeq(windowAlign, maxGapContent,aaFreqsDict)
+					scoresMatrixPerCol=getColumnDistScoreToClosest(windowAlign, matrixAA)
 					P=scoresProb[name][0]
-                                        if P!="NA" and float(P)<0.7: #If after the trimming it's still a useful window
-						windows=fillParametersLists(scoresProb, scoresMatrixPerCol, name, P, windows, start, end)						
+					if P!="NA" and float(P)<0.7: #If after the trimming it's still a useful window
+						#print(scoresMatrixPerCol[name][1])
+						windows=fillParametersLists(scoresProb, scoresMatrixPerCol, name, P, windows, start, end)	
+								
 				else:
 					windows=fillParametersLists(scoresProb, scoresMatrixPerCol, name, P, windows, start, end)
 		j+=step
@@ -89,14 +96,38 @@ for filename in alnNames:
 			windowsMaster[filename]=windows #windows has [SpeciesName]=start, end, P, Z, D, Z62
 
 
+	print(filename + ' done')
+
+jobs = []
+
+manager = Manager()
+
+windowsMaster = manager.dict()
+wrongMaster = manager.dict()
+
+
+for filename in alnNames:
+	if args.cpu:
+		p = mp.Process(target=run_DivA, args=(filename, windowsMaster, wrongMaster, matrixAA), max=args.cpu)
+	else:
+		p = mp.Process(target=run_DivA, args=(filename, windowsMaster, wrongMaster, matrixAA))
+
+	jobs.append(p)
+
+	p.start()
+
+for proc in jobs:
+    proc.join()
+
+
 ########## Calculate thresholds
-print "Calculating the parameters thresholds"
+print("Calculating the parameters thresholds")
 Pthresh,Zthresh,Dthresh,Z62thresh=defineThresholds(windowsMaster, Psd, Zsd, Dsd, Z62sd)
 ### Classify windows
-print "Classifying the windows"
+print ("Classifying the windows")
 windowsMaster=classifyWindows(windowsMaster, Pthresh , Zthresh , Dthresh, Z62thresh )
 ### Merge windows
-print "Merging the windows"
+print ("Merging the windows")
 wrongMaster=getAndMergeWrongWindows(windowsMaster, wrongMaster)
 ### Print wrongMaster 
 
@@ -109,10 +140,11 @@ if len(wrongMaster)>0:
 	OutputDict(out1, wrongMaster) #Print filename per filename
 	### Optional alignment masking
 	if args.mask:
-		print "Masking alignment"
+		print ("Masking alignment")
 		OptmaskAln( wrongMaster )
 ### Print optionally the windowsMaster dict
 if args.printAllwindows:
+	
 	OutputDict(out2, windowsMaster) #Print filename per filename
 
 out1.close()
